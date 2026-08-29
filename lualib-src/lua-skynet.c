@@ -11,12 +11,29 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <inttypes.h>
 
-struct snlua {
-	lua_State * L;
-	struct skynet_context * ctx;
-	const char * preload;
-};
+#include <time.h>
+
+#if defined(__APPLE__)
+#include <sys/time.h>
+#endif
+
+#include "skynet.h"
+
+// return nsec
+static int64_t
+get_time() {
+#if !defined(__APPLE__) || defined(AVAILABLE_MAC_OS_X_VERSION_10_12_AND_LATER)
+	struct timespec ti;
+	clock_gettime(CLOCK_MONOTONIC, &ti);
+	return (int64_t)1000000000 * ti.tv_sec + ti.tv_nsec;
+#else
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return (int64_t)1000000000 * tv.tv_sec + tv.tv_usec * 1000;
+#endif
+}
 
 static int
 traceback (lua_State *L) {
@@ -29,18 +46,16 @@ traceback (lua_State *L) {
 	return 1;
 }
 
+struct callback_context {
+	lua_State *L;
+};
+
 static int
 _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t source, const void * msg, size_t sz) {
-	lua_State *L = ud;
+	struct callback_context *cb_ctx = (struct callback_context *)ud;
+	lua_State *L = cb_ctx->L;
 	int trace = 1;
 	int r;
-	int top = lua_gettop(L);
-	if (top == 0) {
-		lua_pushcfunction(L, traceback);
-		lua_rawgetp(L, LUA_REGISTRYINDEX, _cb);
-	} else {
-		assert(top == 2);
-	}
 	lua_pushvalue(L,2);
 
 	lua_pushinteger(L, type);
@@ -65,9 +80,6 @@ _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t 
 	case LUA_ERRERR:
 		skynet_error(context, "lua error in error : [%x to %s : %d]", source , self, session);
 		break;
-	case LUA_ERRGCMM:
-		skynet_error(context, "lua gc error : [%x to %s : %d]", source , self, session);
-		break;
 	};
 
 	lua_pop(L,1);
@@ -82,23 +94,47 @@ forward_cb(struct skynet_context * context, void * ud, int type, int session, ui
 	return 1;
 }
 
+static void
+clear_last_context(lua_State *L) {
+	if (lua_getfield(L, LUA_REGISTRYINDEX, "callback_context") == LUA_TUSERDATA) {
+		lua_pushnil(L);
+		lua_setiuservalue(L, -2, 2);
+	}
+	lua_pop(L, 1);
+}
+
+static int
+_cb_pre(struct skynet_context * context, void * ud, int type, int session, uint32_t source, const void * msg, size_t sz) {
+	struct callback_context *cb_ctx = (struct callback_context *)ud;
+	clear_last_context(cb_ctx->L);
+	skynet_callback(context, ud, _cb);
+	return _cb(context, cb_ctx, type, session, source, msg, sz);
+}
+
+static int
+_forward_pre(struct skynet_context *context, void *ud, int type, int session, uint32_t source, const void *msg, size_t sz) {
+	struct callback_context *cb_ctx = (struct callback_context *)ud;
+	clear_last_context(cb_ctx->L);
+	skynet_callback(context, ud, forward_cb);
+	return forward_cb(context, cb_ctx, type, session, source, msg, sz);
+}
+
 static int
 lcallback(lua_State *L) {
 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
 	int forward = lua_toboolean(L, 2);
 	luaL_checktype(L,1,LUA_TFUNCTION);
 	lua_settop(L,1);
-	lua_rawsetp(L, LUA_REGISTRYINDEX, _cb);
+	struct callback_context * cb_ctx = (struct callback_context *)lua_newuserdatauv(L, sizeof(*cb_ctx), 2);
+	cb_ctx->L = lua_newthread(L);
+	lua_pushcfunction(cb_ctx->L, traceback);
+	lua_setiuservalue(L, -2, 1);
+	lua_getfield(L, LUA_REGISTRYINDEX, "callback_context");
+	lua_setiuservalue(L, -2, 2);
+	lua_setfield(L, LUA_REGISTRYINDEX, "callback_context");
+	lua_xmove(L, cb_ctx->L, 1);
 
-	lua_rawgeti(L, LUA_REGISTRYINDEX, LUA_RIDX_MAINTHREAD);
-	lua_State *gL = lua_tothread(L,-1);
-
-	if (forward) {
-		skynet_callback(context, gL, forward_cb);
-	} else {
-		skynet_callback(context, gL, _cb);
-	}
-
+	skynet_callback(context, cb_ctx, (forward)?(_forward_pre):(_cb_pre));
 	return 0;
 }
 
@@ -115,6 +151,38 @@ lcommand(lua_State *L) {
 	result = skynet_command(context, cmd, parm);
 	if (result) {
 		lua_pushstring(L, result);
+		return 1;
+	}
+	return 0;
+}
+
+static int
+laddresscommand(lua_State *L) {
+	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
+	const char * cmd = luaL_checkstring(L,1);
+	const char * result;
+	const char * parm = NULL;
+	if (lua_gettop(L) == 2) {
+		parm = luaL_checkstring(L,2);
+	}
+	result = skynet_command(context, cmd, parm);
+	if (result && result[0] == ':') {
+		int i;
+		uint32_t addr = 0;
+		for (i=1;result[i];i++) {
+			int c = result[i];
+			if (c>='0' && c<='9') {
+				c = c - '0';
+			} else if (c>='a' && c<='f') {
+				c = c - 'a' + 10;
+			} else if (c>='A' && c<='F') {
+				c = c - 'A' + 10;
+			} else {
+				return 0;
+			}
+			addr = addr * 16 + c;
+		}
+		lua_pushinteger(L, addr);
 		return 1;
 	}
 	return 0;
@@ -139,7 +207,7 @@ lintcommand(lua_State *L) {
 
 	result = skynet_command(context, cmd, parm);
 	if (result) {
-		char *endptr = NULL; 
+		char *endptr = NULL;
 		lua_Integer r = strtoll(result, &endptr, 0);
 		if (endptr == NULL || *endptr != '\0') {
 			// may be real number
@@ -223,6 +291,11 @@ send_message(lua_State *L, int source, int idx_type) {
 		luaL_error(L, "invalid param %s", lua_typename(L, lua_type(L,idx_type+2)));
 	}
 	if (session < 0) {
+		if (session == -2) {
+			// package is too large
+			lua_pushboolean(L, 0);
+			return 1;
+		}
 		// send to invalid address
 		// todo: maybe throw an error would be better
 		return 0;
@@ -267,8 +340,9 @@ lerror(lua_State *L) {
 	int n = lua_gettop(L);
 	if (n <= 1) {
 		lua_settop(L, 1);
-		const char * s = luaL_tolstring(L, 1, NULL);
-		skynet_error(context, "%s", s);
+		size_t len;
+		const char *s = luaL_tolstring(L, 1, &len);
+		skynet_error(context, "%*s", (int)len, s);
 		return 0;
 	}
 	luaL_Buffer b;
@@ -282,7 +356,9 @@ lerror(lua_State *L) {
 		}
 	}
 	luaL_pushresult(&b);
-	skynet_error(context, "%s", lua_tostring(L, -1));
+	size_t len;
+	const char *s = luaL_tolstring(L, -1, &len);
+	skynet_error(context, "%*s", (int)len, s);
 	return 0;
 }
 
@@ -346,6 +422,79 @@ lnow(lua_State *L) {
 	return 1;
 }
 
+static int
+lhpc(lua_State *L) {
+	lua_pushinteger(L, get_time());
+	return 1;
+}
+
+#define MAX_LEVEL 3
+
+struct source_info {
+	const char * source;
+	int line;
+};
+
+/*
+	string tag
+	string userstring
+	thread co (default nil/current L)
+	integer level (default nil)
+ */
+static int
+ltrace(lua_State *L) {
+	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
+	const char * tag = luaL_checkstring(L, 1);
+	const char * user = luaL_checkstring(L, 2);
+	if (!lua_isnoneornil(L, 3)) {
+		lua_State * co = L;
+		int level;
+		if (lua_isthread(L, 3)) {
+			co = lua_tothread (L, 3);
+			level = luaL_optinteger(L, 4, 1);
+		} else {
+			level = luaL_optinteger(L, 3, 1);
+		}
+		struct source_info si[MAX_LEVEL];
+		lua_Debug d;
+		int index = 0;
+		do {
+			if (!lua_getstack(co, level, &d))
+				break;
+			lua_getinfo(co, "Sl", &d);
+			level++;
+			si[index].source = d.source;
+			si[index].line = d.currentline;
+			if (d.currentline >= 0)
+				++index;
+		} while (index < MAX_LEVEL);
+		switch (index) {
+		case 1:
+			skynet_error(context, "<TRACE %s> %" PRId64 " %s : %s:%d", tag, get_time(), user, si[0].source, si[0].line);
+			break;
+		case 2:
+			skynet_error(context, "<TRACE %s> %" PRId64 " %s : %s:%d %s:%d", tag, get_time(), user,
+				si[0].source, si[0].line,
+				si[1].source, si[1].line
+				);
+			break;
+		case 3:
+			skynet_error(context, "<TRACE %s> %" PRId64 " %s : %s:%d %s:%d %s:%d", tag, get_time(), user,
+				si[0].source, si[0].line,
+				si[1].source, si[1].line,
+				si[2].source, si[2].line
+				);
+			break;
+		default:
+			skynet_error(context, "<TRACE %s> %" PRId64 " %s", tag, get_time(), user);
+			break;
+		}
+		return 0;
+	}
+	skynet_error(context, "<TRACE %s> %" PRId64 " %s", tag, get_time(), user);
+	return 0;
+}
+
 LUAMOD_API int
 luaopen_skynet_core(lua_State *L) {
 	luaL_checkversion(L);
@@ -356,19 +505,27 @@ luaopen_skynet_core(lua_State *L) {
 		{ "redirect", lredirect },
 		{ "command" , lcommand },
 		{ "intcommand", lintcommand },
+		{ "addresscommand", laddresscommand },
 		{ "error", lerror },
-		{ "tostring", ltostring },
 		{ "harbor", lharbor },
+		{ "callback", lcallback },
+		{ "trace", ltrace },
+		{ NULL, NULL },
+	};
+
+	// functions without skynet_context
+	luaL_Reg l2[] = {
+		{ "tostring", ltostring },
 		{ "pack", luaseri_pack },
 		{ "unpack", luaseri_unpack },
 		{ "packstring", lpackstring },
 		{ "trash" , ltrash },
-		{ "callback", lcallback },
 		{ "now", lnow },
+		{ "hpc", lhpc },	// getHPCounter
 		{ NULL, NULL },
 	};
 
-	luaL_newlibtable(L, l);
+	lua_createtable(L, 0, sizeof(l)/sizeof(l[0]) + sizeof(l2)/sizeof(l2[0]) -2);
 
 	lua_getfield(L, LUA_REGISTRYINDEX, "skynet_context");
 	struct skynet_context *ctx = lua_touserdata(L,-1);
@@ -376,7 +533,10 @@ luaopen_skynet_core(lua_State *L) {
 		return luaL_error(L, "Init skynet context first");
 	}
 
+
 	luaL_setfuncs(L,l,1);
+
+	luaL_setfuncs(L,l2,0);
 
 	return 1;
 }
